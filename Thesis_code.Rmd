@@ -1,0 +1,430 @@
+---
+title: "Thesis R code"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(getwd())
+knitr::opts_chunk$set(cache.rebuild = TRUE)
+# handle some engines with their own custom routines 
+```
+
+## Preface
+
+This markdown document contains the code used for the thesis entitled "A Double Machine Learning approach to estimate the causal effects of behavior, beliefs and attitudes about Covid-19 on antibody status".
+Author: Charley Bosman
+
+## Import data and load packages
+```{r loading data and packages, include=FALSE}
+library(causalweight)
+library(dplyr)
+library(tidyr)
+library(psych)
+library(mediation)
+library(plyr)
+library(ggplot2)
+library(naniar)
+library(psych)
+library(performanceEstimation)
+library(curl)
+library(googledrive)
+x <- drive_get("data.csv") # get ID
+id <- "1vTqkm58NYhjp-VBWKMnBdnNu7THhXo0f" # google file ID
+data <- read.csv(sprintf("https://docs.google.com/uc?id=%s&export=download", id), stringsAsFactors=TRUE)
+```
+
+```{r self made functions}
+my_summary <- function(v){
+  if(!any(is.na(v))){
+    res <- c(summary(v),"NA's"=0)
+  } else{
+    res <- summary(v)
+  }
+  return(res)
+}
+
+reverse <- function(x){
+  x = 6-x
+  return(x)
+}
+
+reverse1 <- function(x){
+  x = 1-x
+  return(x)
+}
+
+normalize <- function(x) { 
+  x <- as.matrix(x)
+  minAttr=apply(x, 2, min)
+  maxAttr=apply(x, 2, max)
+  x <- sweep(x, 2, minAttr, FUN="-") 
+  x=sweep(x, 2,  maxAttr-minAttr, "/") 
+  attr(x, 'normalized:min') = minAttr
+  attr(x, 'normalized:max') = maxAttr
+  return (x)
+} 
+```
+
+## Cleaning
+```{r drop NAs of covid result}
+data <- data %>%
+  filter(Covid_result=="neg"|Covid_result=="pos") %>%
+  droplevels()
+table(data$Covid_result)
+newData <- data
+```
+```{r cleaning, removing outliers, detect missing vlalues}
+newData <- newData %>% select(-c(Extra_Anders_text, Extra_Niets))
+
+newData <- newData %>% mutate_at(vars(starts_with("Klacht")), ~replace(., is.na(.), 0))
+newData <- newData %>% mutate_at(vars(starts_with("Extra")), ~replace(., is.na(.), 0))
+
+newData <- newData %>% mutate(sumExtra = select(., starts_with("Extra")) %>% rowSums())
+
+newData <- newData %>% mutate(sumKlacht = select(., starts_with("Klacht")) %>% rowSums())
+
+gg_miss_var(newData)
+gg_miss_upset(newData)
+gg_miss_upset(newData, nsets = n_var_miss(newData))
+
+newData <- newData %>% select(-c(Covid_result_repeat, ResponseType, Huishouden_anders, ThuiswonendeKinderen_0.3, ThuiswonendeKinderen_4.12, ThuiswonendeKinderen_13.17, ThuiswonendeKinderen_18., DirectContact, DirectContactMetCovid,HoeveelPersonenContact, HoeContact, DatumGetest, TweedeOnderzoek, contains("Donor"), contains("Doner"), StartDate, EndDate, BeginKlachten, EindKlachten, ArtsGeweest, Getest))
+
+gg_miss_var(newData)
+
+boxplot(newData$MinutenAandacht)
+outliers <- boxplot(newData$MinutenAandacht,plot=FALSE)$out
+newData <- newData[-which(newData$MinutenAandacht %in% outliers),]
+boxplot(newData$MinutenAandacht)
+
+boxplot(newData$TotaleTijd)
+outliers <- boxplot(newData$TotaleTijd,plot=FALSE)$out
+newData <- newData[-which(newData$TotaleTijd %in% outliers),]
+boxplot(newData$TotaleTijd)
+```
+
+```{r smote method and delete NAs}
+newData <- newData[complete.cases(newData), ]
+newData <- smote(Covid_result ~ ., newData, perc.over = 5.5, perc.under = 1.2)
+table(newData$Covid_result)
+```
+
+```{r rescaling stellingen}
+hist(newData$VertrouwenArtsen)
+newData$VertrouwenArtsen <- reverse(newData$VertrouwenArtsen)
+hist(newData$VertrouwenArtsen)
+hist(newData$EerlijkOverheid)
+newData$EerlijkOverheid <- reverse(newData$EerlijkOverheid)
+hist(newData$EerlijkOverheid)
+hist(newData$VertrouwenGezondheidssysteem)
+newData$VertrouwenGezondheidssysteem <- reverse(newData$VertrouwenGezondheidssysteem)
+hist(newData$VertrouwenGezondheidssysteem)
+hist(newData$VertrouwenOverheid)
+newData$VertrouwenOverheid <- reverse(newData$VertrouwenOverheid)
+hist(newData$VertrouwenOverheid)
+```
+
+## Creating new columns to summarize values
+```{r creating new columns}
+newData <- newData %>% mutate(gedragRIVM = rowMeans(select(newData, starts_with("RIVM")), na.rm = TRUE))
+
+newData <- newData %>% mutate(gedragExtra = select(., starts_with("Extra")) %>% rowSums())
+
+newData <- newData %>% mutate(effectiefmaatregelen = rowMeans(select(newData, starts_with("Effectief")), na.rm = TRUE))
+
+newData <- newData %>% mutate(bezorgd = rowMeans(select(newData, c(starts_with("Bezorgd"), Stelling_SerieuzeZiekte, Stelling_ProblemenOmgeving, Stelling_GroteGevolgen, Stelling_Gespannen, Stelling_Zorgen, Stelling_ZorgenFamilie)), na.rm = TRUE))
+
+newData <- newData %>% mutate(vertrouwen = rowMeans(select(newData, c("VertrouwenOverheid", "EerlijkOverheid", "VertrouwenGezondheidssysteem", "VertrouwenArtsen")), na.rm = TRUE))
+
+means <- newData %>% group_by(Covid_result) %>% summarise_at(c("bezorgd", "gedragRIVM", "gedragExtra", "vertrouwen", "effectiefmaatregelen"), mean, na.rm=TRUE)
+
+control <- newData %>% select(-c(Covid_result, bezorgd, gedragRIVM, gedragExtra, sumExtra, effectiefmaatregelen, vertrouwen, ID, VertrouwenArtsen, VertrouwenGezondheidssysteem, VertrouwenOverheid, EerlijkOverheid, starts_with("Bezorgd"), starts_with("Effectief"), starts_with("Extra"), starts_with("RIVM")))
+
+summary <- newData %>% select(c(Geslacht, Leeftijd, HoogsteOpleiding, sumKlacht, Covid_result, bezorgd, gedragRIVM, gedragExtra, effectiefmaatregelen, vertrouwen, OD.CO, CoronaWeek_Thuiswerken, CoronaWeek_Buitenshuiswerk, CoronaWeek_Nietwerken, NormaleWeek_Thuiswerken, NormaleWeek_Buitenshuiswerken, Normaleweek_Nietwerken, CruciaalBeroep, MinutenAandacht, Stelling_OverspoeldMetInformatie)) %>% drop_na()
+
+summary$Geslacht <- revalue(summary$Geslacht, c("F"="Female", "M"="Male"))
+```
+
+```{r normalize and rescale}
+sum_norm <- summary %>% mutate_at(vars(c(bezorgd, gedragRIVM, gedragExtra, effectiefmaatregelen, vertrouwen)), funs(normalize))
+
+sum_norm <- sum_norm %>% mutate_at(vars(c(bezorgd, gedragRIVM, , effectiefmaatregelen, vertrouwen)), funs(reverse1))
+
+hist(sum_norm$gedragExtra)
+hist(sum_norm$gedragRIVM)
+hist(summary$gedragExtra)
+sum_norm <- sum_norm %>% mutate(gedrag = (gedragRIVM+gedragExtra)/2)
+hist(sum_norm$gedrag)
+```
+## Exploratory data analysis
+
+```{r  exploratory analysis}
+sum_norm <- sum_norm %>% mutate(Leeftijd_cat = cut(Leeftijd, breaks=c(-Inf, 30, 50, Inf), labels=c("<30","30-50",">50")))
+
+meanscovid <- sum_norm %>% group_by(Covid_result) %>% summarise_at(c("bezorgd", "gedragRIVM", "gedragExtra", "gedrag", "vertrouwen", "effectiefmaatregelen"), mean, na.rm=TRUE)
+
+meansage <- sum_norm %>% group_by(Leeftijd_cat, Covid_result, Geslacht) %>% summarise_at(c("bezorgd", "gedragRIVM", "gedragExtra", "gedrag", "vertrouwen", "effectiefmaatregelen"), mean, na.rm=TRUE)
+
+meansgender <- sum_norm %>% group_by(Geslacht, Covid_result) %>% summarise_at(c("bezorgd", "gedragRIVM", "gedragExtra", "gedrag", "vertrouwen", "effectiefmaatregelen"), mean, na.rm=TRUE)
+
+meansall <- newData %>% group_by(Covid_result) %>% summarise_if(is.numeric, mean)
+summary(sum_norm)
+summary(summary)
+summary(meansgender)
+summary(meansage)
+summary(meanscovid)
+summary(newData$Leeftijd)
+```
+
+## Plotting
+```{r plotting histograms}
+mu <- ddply(sum_norm, "Covid_result", summarise, meangedrag=mean(gedrag), meanbezorgd=mean(bezorgd), meanvertrouwen=mean(vertrouwen), effectiefmaatregelenmean=mean(effectiefmaatregelen))
+head(mu)
+
+freqbehavior <- ggplot(sum_norm, aes(x = gedrag, fill=Covid_result)) + geom_density(alpha=0.7) + 
+  geom_vline(data=mu, aes(xintercept = meangedrag, color=Covid_result), linetype="solid", size=1.5) +
+  scale_x_continuous(labels = c("Not so strict", "", "", "", "Very strict"), name = "Behavior") +
+  scale_y_continuous(name="Frequency", limits = c(0,4)) +  scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") + theme_classic() + labs(fill = "Covid result", color = "Covid result") +
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), legend.position = "top", plot.margin =
+          unit(c(1, 1, 0, 0), "cm"))
+
+freqtrust <- ggplot(sum_norm, aes(x = vertrouwen, fill=Covid_result)) + geom_density(alpha=0.7) + 
+  geom_vline(data=mu, aes(xintercept = meanvertrouwen, color=Covid_result), linetype="solid", size=1.5) +
+  scale_x_continuous(labels = c("No trust", "", "", "", "A lot of trust"), name = "Trust") +
+  scale_y_continuous(name="Frequency", limits = c(0,4)) +  scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") + theme_classic() + labs(fill = "Covid result", color = "Covid result") +
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), legend.position = "top", plot.margin =
+          unit(c(1, 1, 0, 0), "cm"))
+
+freqeffective <- ggplot(sum_norm, aes(x = effectiefmaatregelen, fill=Covid_result)) + geom_density(alpha=0.7) + 
+  geom_vline(data=mu, aes(xintercept = effectiefmaatregelenmean, color=Covid_result), linetype="solid", size=1.5) +
+  scale_x_continuous(labels = c("Not effective", "", "", "", "Very effective"), name = "Belief in efficacy of the imposed measures") +
+  scale_y_continuous(name="Frequency", limits = c(0,4)) + scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") + theme_classic() + labs(fill = "Covid result", color = "Covid result") +
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), legend.position = "top", plot.margin =
+          unit(c(1, 1, 0, 0), "cm"))
+
+freqriskperception <- ggplot(sum_norm, aes(x = bezorgd, fill=Covid_result)) + geom_density(alpha=0.7) + 
+  geom_vline(data=mu, aes(xintercept = meanbezorgd, color=Covid_result), linetype="solid", size=1.5) +
+  scale_x_continuous(labels = c("Not concerned", "", "", "", "Very concerned"), name = "Risk perception") +
+  scale_y_continuous(name="Frequency", limits = c(0,4)) +  scale_fill_brewer(palette="Set1") +
+  scale_color_brewer(palette="Set1") + theme_classic() + labs(fill = "Covid result", color = "Covid result") +
+  theme(axis.ticks.y = element_blank(), axis.text.y=element_blank(), legend.position = "top", plot.margin =
+          unit(c(1, 1, 0, 0), "cm"))
+
+freqriskperception
+freqbehavior
+freqeffective
+freqtrust
+
+ggplot(newData, aes(x=Leeftijd, y = Geslacht)) + geom_count()
+```
+
+```{r more plotting exploratory}
+covidage<-ggplot(summary, aes(x=Covid_result, y = Leeftijd)) + geom_violin() + theme_classic() + scale_x_discrete(name="Covid result") + scale_y_continuous(name="Age")
+
+covidgender <- ggplot(summary) +
+  aes(x = Geslacht, fill = factor(Covid_result)) +
+  geom_bar(position = "fill") + scale_x_discrete(name = "Gender", labels = c("Female", "Male")) +
+  scale_fill_brewer(palette="Set1")+
+  scale_y_continuous(name = "Proportion") + labs(fill = "Covid result") + theme_classic()
+
+agebehavior <- ggplot(meansage, aes(x=Leeftijd_cat, y = gedrag, fill = Covid_result)) + geom_bar(stat='identity', position ='dodge') + scale_fill_brewer(palette = "Set1") + theme_classic() + scale_y_continuous(name = "Behavior", limits = c(0,0.8), breaks=c(0,0.8), labels = c("Not strict", "Very strict")) + labs(fill = "Covid result") + scale_x_discrete(name = "Age categories (in years)") + coord_flip() + facet_grid(Geslacht ~ .)
+
+ageriskperception <- ggplot(meansage, aes(x=Leeftijd_cat, y = bezorgd, fill = Covid_result)) + geom_bar(stat='identity', position ='dodge') + scale_fill_brewer(palette = "Set1") + theme_classic() + scale_x_discrete(name = "Age categories (in years)") + labs(fill = "Covid result") + scale_y_continuous(name = "Risk perception", limits = c(0,0.7), breaks=c(0,0.7), labels = c("Not concerned", "Concerned")) + coord_flip() + facet_grid(Geslacht ~ .)
+  
+agemeasures <- ggplot(meansage, aes(x=Leeftijd_cat, y = effectiefmaatregelen, fill = Covid_result)) + geom_bar(stat='identity', position ='dodge') + scale_fill_brewer(palette = "Set1") + theme_classic() + scale_y_continuous(name = "Belief in efficacy of the measures", limits = c(0,0.9), breaks=c(0,0.9), labels = c("Not effective", "Very effective")) +  scale_x_discrete(name = "Age categories (in years)") + labs(fill = "Covid result") + coord_flip() + facet_grid(Geslacht ~ .)
+
+agetrust <- ggplot(meansage, aes(x=Leeftijd_cat, y = vertrouwen, fill = Covid_result)) + geom_bar(stat='identity', position ='dodge') + scale_fill_brewer(palette = "Set1") + theme_classic() + scale_y_continuous(name = "Trust in the government and healthcare", limits = c(0,0.9), breaks=c(0,0.9), labels = c("No trust", "A lot of trust")) +  scale_x_discrete(name = "Age categories (in years)") + labs(fill = "Covid result") + coord_flip() + facet_grid(Geslacht ~ .)
+
+ggplot(sum_norm, aes(x=gedragRIVM, y = gedragExtra)) + geom_smooth(color = "orange") + theme_classic() + scale_color_brewer(palette="Oranges") + scale_x_continuous(name = "Behavior RIVM", limits = c(0,1)) + scale_y_continuous(name = "Behavior Extra", limits = c(0,1))
+
+ggplot(sum_norm, aes(x= effectiefmaatregelen, y = bezorgd, color = Covid_result)) + geom_smooth(method='lm') + theme_classic() + scale_color_brewer(palette="Pastel")
+
+ggplot(sum_norm, aes(x= effectiefmaatregelen, y = vertrouwen, color = Covid_result)) + geom_smooth() + theme_classic() + scale_color_brewer(palette="Dark2")
+
+ggplot(sum_norm, aes(x= bezorgd, y = vertrouwen, color = Covid_result)) + geom_smooth() + theme_classic() + facet_grid(Geslacht ~ Covid_result)
+
+ggplot(sum_norm, aes(x= Leeftijd, y = vertrouwen)) + geom_smooth(method='gam') + theme_classic() + scale_color_brewer(palette="Dark2") + facet_grid(Geslacht ~ Covid_result)
+
+ggplot(sum_norm, aes(x= Leeftijd, y = effectiefmaatregelen)) + geom_smooth(method='gam') + theme_classic() + scale_color_brewer(palette="Dark2") + facet_grid(. ~ Covid_result)
+
+ggplot(sum_norm, aes(x= Leeftijd, y = bezorgd)) + geom_smooth(method='gam') + theme_classic() + scale_color_brewer(palette="Dark2") + scale_y_continuous(breaks = c(0,0.5, 1) , labels = c("Strict adherence","", "No strict adherence")) + facet_grid(Covid_result ~ gedrag_b)
+
+ggplot(sum_norm, aes(x= Leeftijd, y = gedrag)) + geom_smooth(method='gam') + theme_classic() + scale_color_brewer(palette="Dark2") + scale_y_continuous(breaks = c(0,0.5, 1) , labels = c("Strict adherence","", "No strict adherence")) + facet_grid(Covid_result ~ effectiefmaatregelen_b)
+
+ggplot(sum_norm, aes(x = Leeftijd, y = gedrag)) + geom_smooth() + theme_classic() + scale_color_brewer(palette="Dark2") + scale_color_brewer(palette="Dark2") + scale_y_continuous(breaks = c(0,5), labels = c("Strict adherence", "No strict adherence")) + facet_grid(Geslacht ~ Covid_result) 
+
+ggplot(newData, aes(x= bezorgd, y = VertrouwenOverheid, color = Covid_result)) + geom_smooth() + theme_classic() +
+  scale_color_brewer(palette = "Dark2")
+
+ggplot(newData, aes(x= bezorgd, y = VertrouwenGezondheidssysteem, color = Covid_result)) + geom_jitter() + theme_classic() + scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(name = "Risk perception", limits = c(1,5)) +
+  scale_y_continuous(name = "Trust in healthcare", limits = c(0,5))
+
+ggplot(sum_norm, aes(x = gedragRIVM, y = gedragExtra, color=Covid_result)) + geom_jitter(alpha=0.2) + scale_x_continuous(name = "GedragRIVM") + scale_y_continuous(name="GedragExtra") + theme_classic() + theme(plot.margin=unit(c(0.5,1.2,0.5,0.5),"cm"))
+
+ggplot(newData, aes(x = VertrouwenOverheid, y = VertrouwenGezondheidssysteem)) +
+  geom_smooth(method='lm') + facet_grid(. ~ Covid_result) + theme_classic()
+
+ggplot(sum_norm, aes(x = gedrag, y = MinutenAandacht)) +
+  geom_violin() + facet_grid(. ~ Covid_result)
+install.packages("ggstatsplot")
+
+ggplot(sum_norm, aes(x=gedragRIVM, fill = Covid_result)) + geom_histogram(position='dodge')
+
+ggplot(sum_norm, aes(x=gedragExtra, fill = Covid_result)) + geom_histogram(stat='bin',position='identity', alpha=0.5)
+```
+
+```{r create tikz files with the plots}
+###################################
+options(tikzMetricPackages = c("\\usepackage[utf8]{inputenc}","\\usepackage[T1]{fontenc}", "\\usetikzlibrary{calc}", "\\usepackage{amssymb}"))
+
+tikzDevice::tikz(file = "./plots/freqbehavior.tex", width = 5, height = 5)
+freqbehavior
+dev.off()
+
+tikzDevice::tikz(file = "./plots/freqeffective.tex", width = 5, height = 5)
+freqeffective
+dev.off()
+
+tikzDevice::tikz(file = "./plots/freqriskperception.tex", width = 5, height = 5)
+freqriskperception
+dev.off()
+
+tikzDevice::tikz(file = "./plots/freqtrust.tex", width = 5, height = 5)
+freqtrust
+dev.off()
+
+tikzDevice::tikz(file = "./plots/covidage.tex", width = 5, height = 5)
+covidage
+dev.off()
+
+tikzDevice::tikz(file = "./plots/covidgender.tex", width = 5, height = 5)
+covidgender
+dev.off()
+
+tikzDevice::tikz(file = "./plots/agebehavior.tex", width = 5, height = 5)
+agebehavior
+dev.off()
+
+tikzDevice::tikz(file = "./plots/agemeasures.tex", width = 5, height = 5)
+agemeasures
+dev.off()
+
+tikzDevice::tikz(file = "./plots/ageriskperception.tex", width = 5, height = 5)
+ageriskperception
+dev.off()
+
+tikzDevice::tikz(file = "./plots/agetrust.tex", width = 5, height = 5)
+agetrust
+dev.off()
+```
+
+
+## Preprocessing for the analysis 
+For the function medDML the treatment variable needs to be binary. 
+```{r making it binary variables and preprocessing for analysis}
+sum_norm <- sum_norm %>% mutate(effectiefmaatregelen_b = ifelse(effectiefmaatregelen>=mean(effectiefmaatregelen), 1, 0))
+sum_norm <- sum_norm %>% mutate(bezorgd_b = ifelse(bezorgd>=mean(bezorgd), 1, 0))
+sum_norm <- sum_norm %>% mutate(gedragRIVM_b = ifelse(gedragRIVM>=mean(gedragRIVM), 1, 0))
+sum_norm <- sum_norm %>% mutate(gedrag_b = ifelse(gedrag>=mean(gedrag), 1, 0))
+sum_norm <- sum_norm %>% mutate(vertrouwen_b = ifelse(vertrouwen>=mean(vertrouwen), 1, 0))
+sum_norm <- sum_norm %>% mutate(gedragExtra_b = ifelse(gedragExtra>=mean(gedragExtra), 1, 0))
+sum_norm <- sum_norm %>% mutate(outcome_b = ifelse(Covid_result=="pos", 1, 0))
+
+#checking again for na values
+any(apply(summary, 2, function(x) any(is.na(x))))
+asNumeric <- function(x) as.numeric(x)
+
+matrix <- as.matrix(control %>% mutate_if(is.factor, asNumeric) %>% drop_na())
+matrix = normalize(matrix)
+```
+
+## The mediation analysis 
+
+```{r analysis with own data trust}
+d = as.numeric(sum_norm$vertrouwen_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+x = matrix
+output=medDML(y=y,d=d,m=m,x=x, multmed = TRUE)
+print('IV=TRUST')
+round(output$results,3)
+print(output$ntrimmed)
+```
+
+```{r analysis with own data effectivemeasures}
+d = as.numeric(sum_norm$effectiefmaatregelen_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+x = matrix
+
+output=medDML(y=y,d=d,m=m,x=x, trim =0.05)
+round(output$results,10)
+print(output$ntrimmed)
+```
+
+```{r analysis with own data risk perception}
+d = as.numeric(sum_norm$bezorgd_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+x = matrix
+
+output=medDML(y=y,d=d,m=m,x=x, multmed = TRUE, trim=0.05)
+round(output$results,10)
+print(output$ntrimmed)
+```
+
+# Baseline analysis
+```{r mediation analysis with trust}
+d = as.numeric(sum_norm$vertrouwen_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+model.0 <- glm(y ~ d)
+summary(model.0)
+model.M <- glm(m ~ d)
+summary(model.M)
+model.Y <- glm(y ~ d + m)
+summary(model.Y)
+results <- mediate(model.M, model.Y, treat='d', mediator='m',
+                   boot=TRUE, sims=1000)
+summary(results)
+```
+
+```{r mediation anlaysis with effectief maatregelen}
+d = as.numeric(sum_norm$effectiefmaatregelen_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+model.0 <- glm(y ~ d)
+summary(model.0)
+model.M <- glm(m ~ d)
+summary(model.M)
+model.Y <- glm(y ~ d + m)
+summary(model.Y)
+results <- mediate(model.M, model.Y, treat='d', mediator='m',
+                   boot=TRUE, sims=1000)
+plot(results)
+summary(results)
+```
+
+```{r mediation anlaysis with risk perception}
+d = as.numeric(sum_norm$bezorgd_b)
+m = as.numeric(sum_norm$gedrag)
+y = as.numeric(sum_norm$outcome_b)
+model.0 <- lm(y ~ d)
+summary(model.0)
+model.M <- lm(m ~ d)
+summary(model.M)
+model.Y <- lm(y ~ d + m)
+summary(model.Y)
+results <- mediate(model.M, model.Y, treat='d', mediator='m',
+                   boot=TRUE, sims=1000)
+plot(results)
+summary(results)
+```
